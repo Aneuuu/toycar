@@ -2,7 +2,7 @@
 
 两块 ESP32-C3 SuperMini：手柄读摇杆 ADC，经 ESP-NOW 广播（信道 1，20 ms / 50 Hz）控制小车。底盘为阿克曼，后轮驱动（TB6612FNG + 两路 1:48 TT 电机，同速），前轮 MG90S 舵机转向。小车超过 300 ms 收不到合法包则油门/转向回零。
 
-固件分两个 ESP-IDF 工程：`car/`（接收端 + 电机/舵机）与 `remote/`（发送端）。
+固件分两个 ESP-IDF 工程：`car/`（接收端 + 电机/舵机）与 `remote/`（发送端）。TB6612 驱动在 `car/components/tb6612/`。舵机驱动在 `car/components/servo/`。
 
 ## 系统框图
 
