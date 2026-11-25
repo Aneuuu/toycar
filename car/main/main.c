@@ -9,28 +9,17 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
-#include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "packet.h"
+#include "tb6612.h"
 
 static const char *TAG = "car";
 
-#define PIN_PWMA   0
-#define PIN_AIN1   1
-#define PIN_AIN2   3
-#define PIN_PWMB   4
-#define PIN_BIN1   5
-#define PIN_BIN2   6
-#define PIN_STBY   7
 #define PIN_SERVO 10
 
 /* Flip if a rear wheel runs backward. */
 #define MOTOR_A_INVERT 0
 #define MOTOR_B_INVERT 0
-
-#define PWM_FREQ_HZ    20000
-#define PWM_RES        LEDC_TIMER_10_BIT
-#define PWM_MAX        ((1 << 10) - 1)
 
 #define SERVO_FREQ_HZ  50
 #define SERVO_RES      LEDC_TIMER_14_BIT
@@ -41,7 +30,6 @@ static const char *TAG = "car";
 #define SERVO_MAX_US   2000
 
 #define FAILSAFE_US    300000
-#define DEADBAND       40
 #define WIFI_CH        1
 
 static volatile int16_t g_thr;
@@ -59,45 +47,6 @@ static void servo_pulse_us(int us)
     uint32_t duty = (uint32_t)us * ((1 << 14) - 1) / 20000;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
-}
-
-static void motor_set(int16_t thr)
-{
-    if (thr > -DEADBAND && thr < DEADBAND) {
-        thr = 0;
-    }
-    if (thr == 0) {
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
-        gpio_set_level(PIN_AIN1, 0);
-        gpio_set_level(PIN_AIN2, 0);
-        gpio_set_level(PIN_BIN1, 0);
-        gpio_set_level(PIN_BIN2, 0);
-        gpio_set_level(PIN_STBY, 0);
-        return;
-    }
-
-    gpio_set_level(PIN_STBY, 1);
-
-    int fwd = thr > 0;
-    int a_fwd = MOTOR_A_INVERT ? !fwd : fwd;
-    int b_fwd = MOTOR_B_INVERT ? !fwd : fwd;
-    gpio_set_level(PIN_AIN1, a_fwd);
-    gpio_set_level(PIN_AIN2, !a_fwd);
-    gpio_set_level(PIN_BIN1, b_fwd);
-    gpio_set_level(PIN_BIN2, !b_fwd);
-
-    int mag = thr < 0 ? -thr : thr;
-    uint32_t duty = (uint32_t)mag * PWM_MAX / 1000;
-    if (duty > PWM_MAX) {
-        duty = PWM_MAX;
-    }
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
 }
 
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
@@ -137,7 +86,7 @@ static void drive_task(void *arg)
             thr = 0;
             st = 0;
         }
-        motor_set(thr);
+        tb6612_set_throttle(thr);
         servo_pulse_us(SERVO_CENTER_US + SERVO_TRIM + (int)st * SERVO_RANGE_US / 1000);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -167,27 +116,6 @@ static void wifi_now_init(void)
 
 static void io_init(void)
 {
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << PIN_AIN1) | (1ULL << PIN_AIN2) |
-                        (1ULL << PIN_BIN1) | (1ULL << PIN_BIN2) |
-                        (1ULL << PIN_STBY),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io));
-    gpio_set_level(PIN_STBY, 0);
-
-    ledc_timer_config_t t0 = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_0,
-        .duty_resolution = PWM_RES,
-        .freq_hz = PWM_FREQ_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&t0));
-
     ledc_timer_config_t t1 = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .timer_num = LEDC_TIMER_1,
@@ -197,20 +125,15 @@ static void io_init(void)
     };
     ESP_ERROR_CHECK(ledc_timer_config(&t1));
 
-    ledc_channel_config_t ch[] = {
-        { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0,
-          .timer_sel = LEDC_TIMER_0, .gpio_num = PIN_PWMA, .duty = 0,
-          .intr_type = LEDC_INTR_DISABLE },
-        { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1,
-          .timer_sel = LEDC_TIMER_0, .gpio_num = PIN_PWMB, .duty = 0,
-          .intr_type = LEDC_INTR_DISABLE },
-        { .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_2,
-          .timer_sel = LEDC_TIMER_1, .gpio_num = PIN_SERVO, .duty = 0,
-          .intr_type = LEDC_INTR_DISABLE },
+    ledc_channel_config_t ch = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_2,
+        .timer_sel = LEDC_TIMER_1,
+        .gpio_num = PIN_SERVO,
+        .duty = 0,
+        .intr_type = LEDC_INTR_DISABLE,
     };
-    for (int i = 0; i < 3; i++) {
-        ESP_ERROR_CHECK(ledc_channel_config(&ch[i]));
-    }
+    ESP_ERROR_CHECK(ledc_channel_config(&ch));
     servo_pulse_us(SERVO_CENTER_US + SERVO_TRIM);
 }
 
@@ -223,6 +146,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(e);
 
+    ESP_ERROR_CHECK(tb6612_init(MOTOR_A_INVERT, MOTOR_B_INVERT));
     io_init();
     wifi_now_init();
     xTaskCreate(drive_task, "drive", 2048, NULL, 5, NULL);
